@@ -2047,8 +2047,15 @@ bool PurpleTdClient::joinChat(const char *chatName)
                              chatName, chat->title_.c_str());
     else if (purpleId) {
         conv = getChatConversation(m_data, *chat, purpleId);
-        if (conv)
+        if (conv) {
             purple_conversation_present(purple_conv_chat_get_conversation(conv));
+            // webOS: the Messaging app joins a group when it is opened (openChannel). tdlib-purple
+            // only ever shows messages that arrive while connected, so on a new account every group
+            // stayed empty. Load the latest messages (up to 100) the first time each group is opened
+            // this session; the transport skips ones it already has (serviceMessageId dedup).
+            if (m_historyFetchedChats.insert(id.value()).second)
+                fetchHistory(m_data, id, MessageId::invalid, MessageId::invalid);
+        }
     }
 
     return conv ? true : false;

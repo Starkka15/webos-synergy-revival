@@ -5,6 +5,7 @@
 #include "client-utils.h"
 #include <td/telegram/Log.h>
 #include <purple.h>
+#include <set>
 
 enum class BasicGroupMembership: uint8_t {
     Invalid,
@@ -182,6 +183,7 @@ private:
     void                 *m_qrRequest = nullptr;      // open QR request_fields handle, if any
     std::string           m_qrPasswordHint;           // 2FA hint, re-shown on a wrong password
     int                   m_qrPasswordAttempt = 0;    // tells the UI each 2FA prompt is a new one
+    std::set<int64_t>     m_historyFetchedChats;      // groups whose history joinChat loaded
     // the +E.164 being resolved by searchUserByPhoneNumber for an outgoing call; used to push a
     // clean "disconnected" state (so the Phone app card doesn't hang) if the number isn't on Telegram
     std::string           m_pendingCallPhone;
