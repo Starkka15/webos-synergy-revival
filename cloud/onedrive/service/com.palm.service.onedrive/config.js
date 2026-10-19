@@ -50,7 +50,7 @@ var Config = {
 	TOKEN_SEND_SCOPE: true,
 	// Caller allow-lists enforced by _cloudcore/acl.js.
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
-	FILE_APP_IDS:  ["com.quickoffice.webos", "com.quickoffice.ar"]
+	FILE_APP_IDS:  ["com.palm.stark.files.service", "com.quickoffice.webos", "com.quickoffice.ar"]
 };
 
 if (typeof exports !== "undefined") { exports.Config = Config; }
