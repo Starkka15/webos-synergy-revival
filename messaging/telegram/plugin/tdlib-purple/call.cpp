@@ -7,7 +7,9 @@
 #include "purple-info.h"
 #include "td-client.h"
 #include "call-luna.h"
+#ifndef NoVoip
 #include "voipkit-tgvoip.h"
+#endif
 #include <glib.h>
 #include <array>
 

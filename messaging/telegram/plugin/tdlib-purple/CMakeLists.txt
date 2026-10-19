@@ -81,9 +81,13 @@ add_library(telegram-tdlib SHARED
     identifiers.cpp
     secret-chat.cpp
     voipkit.cpp
-    voipkit-tgvoip.cpp
     h264_rtp.c
+    qr-login.cpp
 )
+if (NOT NoVoip)
+    # libtgvoip's video interfaces: only exists in a voice-call build.
+    target_sources(telegram-tdlib PRIVATE voipkit-tgvoip.cpp)
+endif (NOT NoVoip)
 
 if (NOT NoTgcallsLite)
     target_sources(telegram-tdlib PRIVATE
@@ -105,6 +109,14 @@ target_compile_definitions(telegram-tdlib PRIVATE GLIB_DISABLE_DEPRECATION_WARNI
 
 include_directories(${Purple_INCLUDE_DIRS} ${CMAKE_BINARY_DIR})
 target_link_libraries(telegram-tdlib PRIVATE Td::TdStatic ${Purple_LIBRARIES})
+
+# webOS QR login (qr-login.cpp): the tg://login link becomes a PNG QR code. libqrencode is linked
+# statically (messaging/discord/plugin/libqrencode, built PIC); zlib is the device's.
+find_path(QRENCODE_INCLUDE_DIR qrencode.h REQUIRED)
+find_library(QRENCODE_LIBRARY NAMES libqrencode.a qrencode REQUIRED)
+find_package(ZLIB REQUIRED)
+target_include_directories(telegram-tdlib SYSTEM PRIVATE ${QRENCODE_INCLUDE_DIR})
+target_link_libraries(telegram-tdlib PRIVATE ${QRENCODE_LIBRARY} ZLIB::ZLIB)
 
 set(VERSION_SCRIPT_FLAG "-Wl,--version-script=${CMAKE_SOURCE_DIR}/ld_version_script")
 set(CMAKE_EXE_LINKER_FLAGS ${VERSION_SCRIPT_FLAG})
@@ -170,24 +182,25 @@ if (NOT NoVoip)
         # webrtc types we didn't build.
         target_compile_definitions(telegram-tdlib PRIVATE TGVOIP_NO_DSP)
     endif (tgvoip_NO_DSP)
-
-    # voipkit.cpp/voipkit-tgvoip.cpp (native SkypeKit video bridge) link directly against the
-    # real, headerless libpalmgstskype.so on the device firmware image -- see
-    # messaging/whatsapp/calling/WHATSAPP_VIDEO_STATUS.md and
-    # messaging/whatsapp/calling/build-skypekit-send-test.sh for the technique this mirrors.
-    # -Wl,-rpath (not just -rpath-link) bakes /usr/lib/gstreamer-0.10 into the built .so's own
-    # runtime search path so it finds libpalmgstskype.so on-device unconditionally, the same
-    # robustness fix used for the WhatsApp plugin's build-combined.sh.
-    set(SkypeKitFwRootfs "" CACHE STRING "webOS firmware rootfs path (for libpalmgstskype.so)")
-    if (NOT SkypeKitFwRootfs STREQUAL "")
-        target_link_libraries(telegram-tdlib PRIVATE palmgstskype)
-        target_link_options(telegram-tdlib PRIVATE
-            -L${SkypeKitFwRootfs}/usr/lib/gstreamer-0.10
-            -Wl,--allow-shlib-undefined
-            -Wl,-rpath-link,${SkypeKitFwRootfs}/usr/lib
-            -Wl,-rpath,/usr/lib/gstreamer-0.10)
-    endif (NOT SkypeKitFwRootfs STREQUAL "")
 endif (NOT NoVoip)
+
+# voipkit.cpp (native SkypeKit video bridge, built with or without NoVoip: call-luna.cpp uses it)
+# links directly against the real, headerless libpalmgstskype.so on the device firmware image -- see
+# messaging/whatsapp/calling/WHATSAPP_VIDEO_STATUS.md and
+# messaging/whatsapp/calling/build-skypekit-send-test.sh for the technique this mirrors.
+# -Wl,-rpath (not just -rpath-link) bakes /usr/lib/gstreamer-0.10 into the built .so's own
+# runtime search path so it finds libpalmgstskype.so on-device unconditionally, the same
+# robustness fix used for the WhatsApp plugin's build-combined.sh. Without it the plugin is left
+# with undefined Sid:: symbols and libpurple can't load it.
+set(SkypeKitFwRootfs "" CACHE STRING "webOS firmware rootfs path (for libpalmgstskype.so)")
+if (NOT SkypeKitFwRootfs STREQUAL "")
+    target_link_libraries(telegram-tdlib PRIVATE palmgstskype)
+    target_link_options(telegram-tdlib PRIVATE
+        -L${SkypeKitFwRootfs}/usr/lib/gstreamer-0.10
+        -Wl,--allow-shlib-undefined
+        -Wl,-rpath-link,${SkypeKitFwRootfs}/usr/lib
+        -Wl,-rpath,/usr/lib/gstreamer-0.10)
+endif (NOT SkypeKitFwRootfs STREQUAL "")
 
 if (DEFINED STANDARD_LIBRARIES_EXTRA)
     set (CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} ${STANDARD_LIBRARIES_EXTRA}")

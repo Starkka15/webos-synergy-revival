@@ -9,9 +9,15 @@
 #include "secret-chat.h"
 #include "sticker.h"
 #include "receiving.h"
+#include "qr-login.h"
 #include <unistd.h>
 #include <stdlib.h>
 #include <algorithm>
+
+// webOS QR login. The account setup screen (com.palm.app.telegram) has the transport run a
+// pending login with this sentinel as the password (startQRLogin), and the account keeps it once
+// created: from then on the TDLib database holds the session, so no phone number or code is used.
+static const char QrLoginSentinel[] = "QRLOGIN";
 
 // webOS delivery/read receipts: the transport matches an outgoing message's Outbox row by its
 // serviceMessageId, which OutboxIdHandler stamps ASYNCHRONOUSLY right after updateMessageSendSucceeded.
@@ -54,6 +60,11 @@ PurpleTdClient::PurpleTdClient(PurpleAccount *acct, ITransceiverBackend *testBac
 
 PurpleTdClient::~PurpleTdClient()
 {
+    // Open requests (QR image, QR-login 2FA password) carry `this` as their callback data.
+    PurpleConnection *gc = purple_account_get_connection(m_account);
+    if (gc)
+        purple_request_close_with_handle(gc);
+
     std::vector<PurpleXfer *> transfers;
     m_data.removeAllFileTransfers(transfers);
     for (PurpleXfer *xfer: transfers) {
@@ -334,8 +345,21 @@ void PurpleTdClient::processAuthorizationState(td::td_api::AuthorizationState &a
 
     case td::td_api::authorizationStateWaitPhoneNumber::ID:
         purple_debug_misc(config::pluginId, "Authorization state update: phone number requested\n");
-        sendPhoneNumber();
+        if (isQrLogin())
+            m_transceiver.sendQuery(td::td_api::make_object<td::td_api::requestQrCodeAuthentication>(
+                                        std::vector<td::td_api::int53>()),
+                                    &PurpleTdClient::authResponse);
+        else
+            sendPhoneNumber();
         break;
+
+    case td::td_api::authorizationStateWaitOtherDeviceConfirmation::ID: {
+        // Sent again with a fresh link each time the previous one expires (about every 30s).
+        auto &qrState = static_cast<const td::td_api::authorizationStateWaitOtherDeviceConfirmation &>(authState);
+        purple_debug_misc(config::pluginId, "Authorization state update: QR login link\n");
+        showLoginQr(qrState.link_);
+        break;
+    }
 
     case td::td_api::authorizationStateWaitCode::ID: {
         auto &codeState = static_cast<td::td_api::authorizationStateWaitCode &>(authState);
@@ -359,6 +383,14 @@ void PurpleTdClient::processAuthorizationState(td::td_api::AuthorizationState &a
 
     case td::td_api::authorizationStateReady::ID:
         purple_debug_misc(config::pluginId, "Authorization state update: ready\n");
+        closeLoginQr();
+        // The transport's QR poll (qrTokenPoll) confirms a pending login once the account has a
+        // "credentials" setting, then keeps this already-connected login for the new account
+        // ("session" mode). A "token" setting would instead make it delete this login, and with it
+        // the TDLib session, so the account would start over. The value is what the setup screen
+        // stores as the password.
+        if (isQrLogin())
+            purple_account_set_string(m_account, "credentials", QrLoginSentinel);
         onLoggedIn();
         break;
     }
@@ -566,6 +598,130 @@ void PurpleTdClient::promptAuthInputViaChat(AuthInput type, const std::string &m
                                   time(NULL));
 }
 
+bool PurpleTdClient::isQrLogin()
+{
+    return g_strcmp0(purple_account_get_password(m_account), QrLoginSentinel) == 0;
+}
+
+void PurpleTdClient::showLoginQr(const std::string &link)
+{
+    PurpleConnection          *gc    = purple_account_get_connection(m_account);
+    PurpleRequestUiOps        *uiOps = purple_request_get_ui_ops();
+    std::vector<unsigned char> png   = makeQrPng(link);
+    if (!uiOps || !uiOps->request_fields || png.empty()) {
+        // Only the setup screen can show the code: a session revoked later lands here with no one
+        // looking, so say how to get a new one.
+        purple_connection_error(gc, _("Telegram sign-in expired. Remove the account and add it again to scan a new QR code."));
+        return;
+    }
+
+    // The transport keys the QR on the "qr_image" field (and offers "qr_string" as text); a new
+    // link replaces the image the setup screen shows.
+    closeLoginQr();
+    PurpleRequestFields     *fields = purple_request_fields_new();
+    PurpleRequestFieldGroup *group  = purple_request_field_group_new(NULL);
+    purple_request_fields_add_group(fields, group);
+    PurpleRequestField *field = purple_request_field_string_new("qr_string", _("QR Code Data"), link.c_str(), FALSE);
+    purple_request_field_string_set_editable(field, FALSE);
+    purple_request_field_group_add_field(group, field);
+    field = purple_request_field_image_new("qr_image", _("QR Code Image"),
+                                           reinterpret_cast<const char *>(png.data()), png.size());
+    purple_request_field_group_add_field(group, field);
+
+    m_qrRequest = purple_request_fields(gc,
+                                        _("Logon QR Code"),
+                                        _("Scan this code with Telegram on your phone"),
+                                        _("Settings > Devices > Link Desktop Device"),
+                                        fields,
+                                        _("_OK"), G_CALLBACK(qrRequestClosed),
+                                        _("_Cancel"), G_CALLBACK(qrRequestClosed),
+                                        m_account,
+                                        purple_account_get_username(m_account),
+                                        NULL, // conversation
+                                        this);
+}
+
+void PurpleTdClient::closeLoginQr()
+{
+    if (m_qrRequest) {
+        purple_request_close(PURPLE_REQUEST_FIELDS, m_qrRequest);
+        m_qrRequest = nullptr;
+    }
+}
+
+void PurpleTdClient::qrRequestClosed(PurpleTdClient *self)
+{
+    self->m_qrRequest = nullptr;
+}
+
+// The transport's auth channel has one input slot, built for Discord's captcha: the setup screen
+// recognises captcha_service "telegram-2fa" and asks for the password instead, which comes back
+// as "captcha_key". captcha_rqdata numbers the prompts, so a retry after a wrong password reads
+// as a new one.
+void PurpleTdClient::requestQrPassword(const std::string &hint)
+{
+    m_qrPasswordAttempt++;
+    std::string attempt = std::to_string(m_qrPasswordAttempt);
+
+    PurpleRequestFields     *fields = purple_request_fields_new();
+    PurpleRequestFieldGroup *group  = purple_request_field_group_new(NULL);
+    purple_request_fields_add_group(fields, group);
+    const struct { const char *id; const char *value; } readOnly[] = {
+        {"captcha_service", "telegram-2fa"},
+        {"captcha_sitekey", hint.c_str()},
+        {"captcha_rqdata",  attempt.c_str()},
+        {"captcha_rqtoken", ""},
+    };
+    for (const auto &f: readOnly) {
+        PurpleRequestField *field = purple_request_field_string_new(f.id, f.id, f.value, FALSE);
+        purple_request_field_string_set_editable(field, FALSE);
+        purple_request_field_group_add_field(group, field);
+    }
+    PurpleRequestField *field = purple_request_field_string_new("captcha_key", _("Password"), "", FALSE);
+    purple_request_field_string_set_masked(field, TRUE);
+    purple_request_field_group_add_field(group, field);
+
+    purple_request_fields(purple_account_get_connection(m_account),
+                          _("Password"),
+                          _("Enter password for two-factor authentication"),
+                          hint.empty() ? NULL : hint.c_str(),
+                          fields,
+                          _("_OK"), G_CALLBACK(qrPasswordEntered),
+                          _("_Cancel"), G_CALLBACK(passwordCancelled),
+                          m_account,
+                          purple_account_get_username(m_account),
+                          NULL, // conversation
+                          this);
+}
+
+void PurpleTdClient::qrPasswordEntered(PurpleTdClient *self, PurpleRequestFields *fields)
+{
+    purple_debug_misc(config::pluginId, "QR login: password entered\n");
+    auto checkPassword = td::td_api::make_object<td::td_api::checkAuthenticationPassword>();
+    const char *password = purple_request_fields_get_string(fields, "captcha_key");
+    if (password)
+        checkPassword->password_ = password;
+    self->m_transceiver.sendQuery(std::move(checkPassword), &PurpleTdClient::qrPasswordResponse);
+}
+
+void PurpleTdClient::qrPasswordResponse(uint64_t requestId, td::td_api::object_ptr<td::td_api::Object> object)
+{
+    if (object && (object->get_id() == td::td_api::ok::ID))
+        return;
+    // A typo shouldn't end the login: failing it would have the transport drop the pending account,
+    // and with it the session the phone just approved.
+    if (object && (object->get_id() == td::td_api::error::ID) &&
+        (static_cast<const td::td_api::error &>(*object).message_ == "PASSWORD_HASH_INVALID"))
+    {
+        std::string message = _("Wrong password, try again.");
+        if (!m_qrPasswordHint.empty())
+            message += "\n" + m_qrPasswordHint;
+        requestQrPassword(message);
+        return;
+    }
+    notifyAuthError(object);
+}
+
 void PurpleTdClient::requestAuthCode(const td::td_api::authenticationCodeInfo *codeInfo)
 {
     // TRANSLATOR: Authentication dialog, primary content. Will be followed by instructions and an input box.
@@ -648,6 +804,15 @@ void PurpleTdClient::requestPassword(const td::td_api::authorizationStateWaitPas
             hints += '\n';
         // TRANSLATOR: 2FA dialog, secondary content, appears in new line. Argument is an e-mail address.
         hints += formatMessage(_("Recovery e-mail may have been sent to {}"), pwInfo.recovery_email_address_pattern_);
+    }
+    PurpleRequestUiOps *uiOps = purple_request_get_ui_ops();
+    if (isQrLogin() && uiOps && uiOps->request_fields) {
+        // QR login: the code was scanned, so the setup screen is still waiting on this login.
+        // Ask there; the "Telegram" chat isn't reachable before the account exists.
+        closeLoginQr();
+        m_qrPasswordHint = hints;
+        requestQrPassword(hints);
+        return;
     }
     if (!purple_request_input (purple_account_get_connection(m_account),
                                // TRANSLATOR: 2FA dialog, title

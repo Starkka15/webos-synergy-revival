@@ -99,6 +99,16 @@ private:
     // webOS fallback: prompt for an auth value through a "Telegram" IM conversation
     // and remember which value we're waiting for (see m_authInputPending).
     void       promptAuthInputViaChat(AuthInput type, const std::string &message);
+    // webOS QR login (account password = QrLoginSentinel): TDLib's tg://login link goes to the
+    // transport's auth channel as a QR image (request_fields "qr_image"), and a 2FA password is
+    // asked for over the same channel's input slot (captcha_service "telegram-2fa").
+    bool       isQrLogin();
+    void       showLoginQr(const std::string &link);
+    void       closeLoginQr();
+    void       requestQrPassword(const std::string &hint);
+    static void qrRequestClosed(PurpleTdClient *self);
+    static void qrPasswordEntered(PurpleTdClient *self, PurpleRequestFields *fields);
+    void       qrPasswordResponse(uint64_t requestId, td::td_api::object_ptr<td::td_api::Object> object);
     void       authResponse(uint64_t requestId, td::td_api::object_ptr<td::td_api::Object> object);
     void       notifyAuthError(const td::td_api::object_ptr<td::td_api::Object> &response);
     void       setPurpleConnectionInProgress();
@@ -169,6 +179,9 @@ private:
     // through a "Telegram" IM conversation and capturing the user's reply in
     // tgprpl_send_im -> sendMessage. This tracks which auth value we're waiting for.
     AuthInput             m_authInputPending = AuthInput::None;
+    void                 *m_qrRequest = nullptr;      // open QR request_fields handle, if any
+    std::string           m_qrPasswordHint;           // 2FA hint, re-shown on a wrong password
+    int                   m_qrPasswordAttempt = 0;    // tells the UI each 2FA prompt is a new one
     // the +E.164 being resolved by searchUserByPhoneNumber for an outgoing call; used to push a
     // clean "disconnected" state (so the Phone app card doesn't hang) if the number isn't on Telegram
     std::string           m_pendingCallPhone;
