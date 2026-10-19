@@ -12,6 +12,8 @@
 	{ "source": "../_cloudcore/cloudservice.js" },
 	{ "source": "../_cloudcore/commands/getAuthorizeUrl_command.js" },
 	{ "source": "../_cloudcore/commands/exchangeCode_command.js" },
+	{ "source": "../_cloudcore/commands/startDeviceLogin_command.js" },
+	{ "source": "../_cloudcore/commands/pollDeviceLogin_command.js" },
 	{ "source": "../_cloudcore/commands/checkCredentials_command.js" },
 	{ "source": "../_cloudcore/commands/listFolder_command.js" },
 	{ "source": "../_cloudcore/commands/uploadFile_command.js" },

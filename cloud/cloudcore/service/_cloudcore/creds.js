@@ -1,4 +1,4 @@
-/*global IMPORTS, console */
+/*global IMPORTS, Adapter, Config, console */
 /* creds.js - resolve/persist Google Drive account credentials from the service side.
  *
  * A consumer app can pass raw { credentials:{common:{...}} }, OR just an { accountId }
@@ -40,6 +40,32 @@ var AccountCreds = {
 				return;
 			}
 			f.result = c;
+		});
+		return f;
+	},
+
+	// fromTokens(t) -> Future resolving to the account-create result for a fresh OAuth2 token
+	// result: credentials in the shape the account DB stores, PLUS a username, because
+	// accounts/handlers/create.js does Assert.require(args.username) and refuses to create the
+	// account without one. The identity fetch may fail (still create the account with a
+	// fallback name) - we already have valid tokens. Shared by exchangeCode + pollDeviceLogin.
+	fromTokens: function (t) {
+		var f = new Future();
+		var common = {
+			accessToken:  t.accessToken,
+			refreshToken: t.refreshToken,
+			expiresAt:    Date.now() + (t.expiresIn * 1000)
+		};
+		var info = Adapter.getAccountInfo(common);
+		info.then(this, function () {
+			var u = {};
+			try { u = (info.result && info.result.user) || {}; } catch (e) { u = {}; }
+			f.result = {
+				returnValue: true,
+				username:    u.emailAddress || (Config && Config.DISPLAY_NAME) || "Cloud account",
+				alias:       u.displayName || undefined,
+				credentials: { common: common }
+			};
 		});
 		return f;
 	},

@@ -1,4 +1,4 @@
-/*global OAuth2, Adapter, Config, console */
+/*global OAuth2, AccountCreds, console */
 /* exchangeCode - the account VALIDATOR. Called by com.palm.service.accounts (via the
  * customUI auth webview) with the ?code=... captured from the OAuth2 redirect. Returns
  * credentials in the shape the account DB stores and the Adapter later reads, PLUS a
@@ -26,24 +26,8 @@ ExchangeCodeCommandAssistant.prototype = {
 			var t;
 			try { t = ex.result; }               // throws if ex carried an exception
 			catch (e) { future.setException(e); return; }
-			var common = {
-				accessToken:  t.accessToken,
-				refreshToken: t.refreshToken,
-				expiresAt:    Date.now() + (t.expiresIn * 1000)
-			};
-			// Fetch the account identity (email/name) for `username`. Tolerate a failure here
-			// (still create the account with a fallback) - we already have valid tokens.
-			var info = Adapter.getAccountInfo(common);
-			info.then(this, function () {
-				var u = {};
-				try { u = (info.result && info.result.user) || {}; } catch (e2) { u = {}; }
-				future.result = {
-					returnValue: true,
-					username:    u.emailAddress || (Config && Config.DISPLAY_NAME) || "Cloud account",
-					alias:       u.displayName || undefined,
-					credentials: { common: common }
-				};
-			});
+			var acct = AccountCreds.fromTokens(t);
+			acct.then(this, function () { future.result = acct.result; });
 		});
 	}
 };

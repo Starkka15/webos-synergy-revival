@@ -28,6 +28,9 @@ var Config = {
 	// Microsoft identity platform v2.0 (common = work/school OR personal accounts)
 	AUTHORIZE_URL: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
 	TOKEN_URL:     "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+	// Device code sign-in (microsoft.com/devicelogin): the user signs in on their phone/PC
+	// instead of in the slow embedded webview. Needs "Allow public client flows" = Yes above.
+	DEVICE_CODE_URL: "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode",
 
 	// Microsoft Graph REST
 	API_BASE:      "https://graph.microsoft.com/v1.0",  // /me, /me/drive/...

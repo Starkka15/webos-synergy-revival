@@ -16,6 +16,13 @@
  * for the provider's redirect_uri (?code=...). We then hand the code (+ PKCE verifier, + any
  * region hints) to the service's exchangeCode and return { returnValue, credentials, template }.
  *
+ * DEVICE CODE: a service whose config sets DEVICE_CODE_URL (OneDrive) offers startDeviceLogin /
+ * pollDeviceLogin, and Sign In tries that first: we show the code and the page to enter it on
+ * (microsoft.com/devicelogin), the user signs in on their phone/PC - email codes, 2FA and all -
+ * and we poll until the service returns the same result exchangeCode would. Every page of a
+ * provider sign-in takes 10-20s to load in the webview, so a multi-step one (Microsoft's email
+ * code) is much better done elsewhere. Services without it fall back to the webview flow.
+ *
  * REDIRECT CAPTURE: cloud redirect_uris are NOT the msauth.* native scheme (they are per-provider
  * http/https/custom URIs), so the engine's native-scheme oauthRedirect hook (msauth only) does not
  * fire for them. Instead we capture in JS from the WebView's onUrlRedirected / onPageTitleChanged
@@ -75,7 +82,20 @@ enyo.kind({
 		{ name: "entryView", kind: "Scroller", flex: 1, components: [
 			{ className: "box-center", components: [
 				{ name: "status", className: "accounts-body-text", style: "padding:16px; line-height:1.4;",
-					content: "Tap Sign In to sign in right here. After you approve access, you'll be returned automatically." }
+					content: "Tap Sign In to connect your account. After you approve access, you'll be returned automatically." }
+			]}
+		]},
+		// Device code sign-in view (providers with startDeviceLogin): the code to enter on another
+		// device, and where. Shown instead of the inline webview; see startDeviceAuth().
+		{ name: "deviceView", kind: "Scroller", flex: 1, showing: false, components: [
+			{ className: "box-center", components: [
+				{ className: "accounts-body-text device-text", content: "On your phone or computer, go to" },
+				{ name: "deviceUri", className: "device-uri" },
+				{ className: "accounts-body-text device-text", content: "and enter this code:" },
+				{ name: "deviceCode", className: "device-code" },
+				{ name: "deviceStatus", className: "accounts-body-text device-text device-status" },
+				{ kind: "Button", caption: "Sign in on this device instead", className: "accounts-btn",
+					onclick: "useBrowserSignIn" }
 			]}
 		]},
 		// Inline OAuth2 sign-in view. The Atlas-routed WebView is created lazily in performSignIn().
@@ -133,11 +153,117 @@ enyo.kind({
 
 	setStatus: function (t) { this.$.status.setContent(t); },
 
-	// Step 1: get the authorize URL (+ PKCE verifier) from the (derived) service.
+	// Step 1: device code sign-in where the service offers it (startDeviceLogin); any failure,
+	// including a service without that method, falls back to the embedded browser sign-in.
 	performSignIn: function () {
 		if (this.done) { return; }
 		if (!this.serviceUri) { this.finish({ returnValue: false, errorCode: "NO_SERVICE" }); return; }
 		this.$.signInButton.setDisabled(true);
+		this.setStatus("Getting a sign-in code…");
+		this.$.svc.call({}, {
+			method: "startDeviceLogin",
+			onSuccess: "startDeviceAuth",
+			onFailure: "startBrowserSignIn"
+		});
+	},
+
+	// ---- device code sign-in (RFC 8628) -------------------------------------
+	// The user signs in on another device; we poll the service (which polls the provider's token
+	// endpoint) at the provider's interval until they finish or the code expires. No deadline of our
+	// own: the code's expiry is the provider's, and Cancel stops it.
+	startDeviceAuth: function (inSender, inResponse) {
+		if (this.done) { return; }
+		if (!inResponse || !inResponse.deviceCode) { this.startBrowserSignIn(); return; }
+		this.clearDeviceTimers();
+		this._deviceGen = (this._deviceGen || 0) + 1;
+		this._deviceCode = inResponse.deviceCode;
+		this._deviceInterval = (inResponse.interval || 5) * 1000;
+		this._deviceExpiresAt = Date.now() + (inResponse.expiresIn || 900) * 1000;
+		this.$.deviceUri.setContent((inResponse.verificationUri || "").replace(/^https?:\/\//, ""));
+		this.$.deviceCode.setContent(inResponse.userCode || "");
+		this.$.entryView.hide();
+		this.$.deviceView.show();
+		this.log("cloud-auth: device sign-in started, code expires in " + inResponse.expiresIn + "s");
+		var self = this;
+		this.updateDeviceStatus();
+		this._deviceTicker = window.setInterval(function () { self.updateDeviceStatus(); }, 1000);
+		this.scheduleDevicePoll();
+	},
+
+	updateDeviceStatus: function () {
+		var left = Math.max(0, Math.round((this._deviceExpiresAt - Date.now()) / 1000));
+		if (left === 0) {
+			this.abortDevice("That code expired. Tap Sign In to get a new one.");
+			return;
+		}
+		var s = left % 60;
+		this.$.deviceStatus.setContent("Waiting for you to sign in… (code expires in " +
+			Math.floor(left / 60) + ":" + (s < 10 ? "0" : "") + s + ")");
+	},
+
+	scheduleDevicePoll: function () {
+		var self = this, gen = this._deviceGen;
+		this._devicePollTimer = window.setTimeout(function () {
+			if (self.done || gen !== self._deviceGen) { return; }
+			self.$.svc.call({ deviceCode: self._deviceCode }, {
+				method: "pollDeviceLogin",
+				onSuccess: "devicePollResult",
+				onFailure: "devicePollFailure",
+				gen: gen
+			});
+		}, this._deviceInterval);
+	},
+
+	devicePollResult: function (inSender, inResponse, inRequest) {
+		if (this.done || !this._deviceCode || (inRequest && inRequest.gen !== this._deviceGen)) { return; }
+		if (inResponse && inResponse.pending) {
+			if (inResponse.slowDown) { this._deviceInterval += 5000; }
+			this.scheduleDevicePoll();
+			return;
+		}
+		this.clearDeviceTimers();
+		this.exchangeSuccess(inSender, inResponse);
+	},
+
+	devicePollFailure: function (inSender, inResponse, inRequest) {
+		if (this.done || !this._deviceCode || (inRequest && inRequest.gen !== this._deviceGen)) { return; }
+		var code = inResponse && inResponse.errorCode;
+		if (code === "DEVICE_CODE_EXPIRED") {
+			this.abortDevice("That code expired. Tap Sign In to get a new one.");
+		} else if (code === "DEVICE_LOGIN_DECLINED") {
+			this.abortDevice("Sign-in was declined. Tap Sign In to try again.");
+		} else {
+			// A dropped connection or a busy service: keep polling until the code expires.
+			this.log("cloud-auth: device poll failed, retrying: " + enyo.json.stringify(inResponse));
+			this.scheduleDevicePoll();
+		}
+	},
+
+	clearDeviceTimers: function () {
+		if (this._devicePollTimer) { window.clearTimeout(this._devicePollTimer); this._devicePollTimer = null; }
+		if (this._deviceTicker) { window.clearInterval(this._deviceTicker); this._deviceTicker = null; }
+	},
+
+	// Leave the device view for the entry view (expired/declined), ignoring any poll in flight.
+	abortDevice: function (msg) {
+		this.clearDeviceTimers();
+		this._deviceCode = null;
+		this._deviceGen = (this._deviceGen || 0) + 1;
+		this.$.deviceView.hide();
+		this.$.entryView.show();
+		this.$.signInButton.setDisabled(false);
+		this.setStatus(msg || "");
+	},
+
+	useBrowserSignIn: function () {
+		this.abortDevice("");
+		this.$.signInButton.setDisabled(true);
+		this.startBrowserSignIn();
+	},
+
+	// Browser sign-in, step 1: get the authorize URL (+ PKCE verifier) from the (derived) service.
+	startBrowserSignIn: function () {
+		if (this.done) { return; }
 		this.setStatus("Opening sign-in…");
 		this.$.svc.call({ state: "cloud" }, {
 			method: "getAuthorizeUrl",
@@ -367,6 +493,7 @@ enyo.kind({
 	cancel: function () {
 		if (this.done) { return; }
 		this.clearOAuthTimers();
+		this.clearDeviceTimers();
 		this.destroyOAuthWeb();
 		this.finish({});   // empty result => cancelled
 	},
@@ -374,7 +501,11 @@ enyo.kind({
 	finish: function (result) {
 		this.done = true;
 		this.clearOAuthTimers();
-		this.log("cloud-auth: sending result " + enyo.json.stringify(result));
+		this.clearDeviceTimers();
+		// Never log the credentials: this line lands in /var/log/messages with the tokens in it.
+		var shown = enyo.mixin({}, result);
+		if (shown.credentials) { shown.credentials = "<redacted>"; }
+		this.log("cloud-auth: sending result " + enyo.json.stringify(shown));
 		this.$.xresult.sendResult(result);
 	},
 

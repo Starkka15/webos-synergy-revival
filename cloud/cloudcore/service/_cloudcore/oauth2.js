@@ -89,14 +89,99 @@ var OAuth2 = {
 					status: r && r.status, body: r && r.responseText });
 				return;
 			}
-			var t = JSON.parse(r.responseText);
+			f.result = this._tokenResult(JSON.parse(r.responseText));
+		});
+		return f;
+	},
+
+	_tokenResult: function (t) {
+		return {
+			returnValue:  true,
+			accessToken:  t.access_token,
+			refreshToken: t.refresh_token,
+			expiresIn:    t.expires_in,
+			tokenType:    t.token_type
+		};
+	},
+
+	// ---- Device Authorization Grant (RFC 8628) --------------------------------------
+	// Opt-in per provider via Config.DEVICE_CODE_URL. The user signs in on another device
+	// (phone/PC) at the provider's verification page and types a short user_code there,
+	// while we poll the token endpoint. No embedded browser: the provider's pages (and any
+	// email/SMS/2FA step) run on the other device at the user's own pace, instead of in a
+	// slow Atlas webview under a fixed deadline.
+	startDevice: function () {
+		var f = new Future();
+		if (!Config.DEVICE_CODE_URL) {
+			f.setException({ returnValue: false, errorCode: "NOT_SUPPORTED" });
+			return f;
+		}
+		f.now(this, function () {
+			return HttpCurl.request({ method: "POST", url: Config.DEVICE_CODE_URL,
+				form: { client_id: Config.CLIENT_ID, scope: Config.SCOPE } });
+		});
+		f.then(this, function () {
+			var r = f.result, t = null;
+			try { t = JSON.parse(r.responseText); } catch (e) { t = null; }
+			if (r.status !== 200 || !t || !t.device_code) {
+				console.log((Config.SERVICE_NAME || "cloud") + ": device code request failed status=" +
+					r.status + " body=" + r.responseText);
+				f.setException({ returnValue: false, errorCode: "DEVICE_CODE_FAILED",
+					status: r.status, body: r.responseText });
+				return;
+			}
 			f.result = {
-				returnValue:  true,
-				accessToken:  t.access_token,
-				refreshToken: t.refresh_token,
-				expiresIn:    t.expires_in,
-				tokenType:    t.token_type
+				returnValue:     true,
+				deviceCode:      t.device_code,
+				userCode:        t.user_code,
+				// RFC 8628 says verification_uri; Google's older endpoint says verification_url.
+				verificationUri: t.verification_uri || t.verification_url,
+				verificationUriComplete: t.verification_uri_complete,
+				expiresIn:       t.expires_in,
+				interval:        t.interval || 5
 			};
+		});
+		return f;
+	},
+
+	// One poll of the token endpoint. Resolves to the token result once the user has
+	// signed in, or to { pending: true, slowDown } while they haven't yet. A pending poll
+	// is the normal case, so unlike _postToken it is not logged.
+	pollDevice: function (deviceCode) {
+		var f = new Future();
+		var form = {
+			client_id:   Config.CLIENT_ID,
+			grant_type:  "urn:ietf:params:oauth:grant-type:device_code",
+			device_code: deviceCode
+		};
+		if (_hasSecret()) { form.client_secret = Config.CLIENT_SECRET; }
+		f.now(this, function () {
+			return HttpCurl.request({ method: "POST", url: Config.TOKEN_URL, form: form });
+		});
+		f.then(this, function () {
+			var r = f.result, t = null;
+			try { t = JSON.parse(r.responseText); } catch (e) { t = null; }
+			if (r.status === 200 && t && t.access_token) {
+				f.result = this._tokenResult(t);
+				return;
+			}
+			var err = (t && t.error) || "";
+			if (err === "authorization_pending" || err === "slow_down") {
+				f.result = { returnValue: true, pending: true, slowDown: err === "slow_down" };
+				return;
+			}
+			if (err === "expired_token") {
+				f.setException({ returnValue: false, errorCode: "DEVICE_CODE_EXPIRED" });
+				return;
+			}
+			if (err === "authorization_declined" || err === "access_denied") {
+				f.setException({ returnValue: false, errorCode: "DEVICE_LOGIN_DECLINED" });
+				return;
+			}
+			console.log((Config.SERVICE_NAME || "cloud") + ": device token poll failed status=" +
+				r.status + " body=" + r.responseText);
+			f.setException({ returnValue: false, errorCode: "OAUTH_TOKEN_FAILED",
+				status: r.status, body: r.responseText });
 		});
 		return f;
 	},
